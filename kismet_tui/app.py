@@ -17,6 +17,7 @@ import time
 from collections import Counter
 
 from rich.text import Text
+from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
@@ -80,6 +81,7 @@ class KismetTUI(App):
         Binding("i", "toggle_inferred", "Inferred"),
         Binding("s", "cycle_sort", "Sort"),
         Binding("S", "toggle_sort_dir", "Reverse sort"),
+        Binding("u", "toggle_release", "Release selection"),
         Binding("e", "export_csv", "Export CSV"),
     ]
 
@@ -97,6 +99,8 @@ class KismetTUI(App):
         self.paused = False
         self.sort_by = "signal"
         self.sort_flipped = False
+        self.released = False     # selection released: no device anchor
+        self._in_render = False   # guard: ignore highlight events we cause
         self.phy_filter = "ALL"
         self.new_only = False
         self.show_inferred = False
@@ -236,36 +240,58 @@ class KismetTUI(App):
             f"sort:{self.sort_by}{'↓' if self.sort_reverse else '↑'}"
             f"  phy:{self.phy_filter}"
             f"{'  NEW-ONLY' if self.new_only else ''}"
-            f"{'  +inferred' if self.show_inferred else ''}")
+            f"{'  +inferred' if self.show_inferred else ''}"
+            f"{'  RELEASED' if self.released else ''}")
 
     def _render_all(self) -> None:
-        self._render_chrome()
-        table = self.query_one("#devices", DataTable)
-        cursor_mac = None
-        if table.cursor_row is not None and 0 <= table.cursor_row < len(self._by_row):
-            cursor_mac = self._by_row[table.cursor_row].mac
-        rows = self.visible()
-        table.clear()
-        self._by_row = rows
-        for d in rows:
-            table.add_row(
-                Text(str(d.signal) if d.signal else "—", style=sig_style(d.signal)),
-                Text(d.signal_bar(6), style=sig_style(d.signal)),
-                d.mac, d.display_name[:19], d.category[:6], (d.crypt or "—")[:10],
-                d.channel or "—", str(d.packets), fmt_age(d.last_seen),
-                Text("NEW", style="bold black on yellow") if d.is_new else "",
-                key=d.mac or d.key)
-        if cursor_mac:
-            for i, d in enumerate(rows):
-                if d.mac == cursor_mac:
-                    table.move_cursor(row=i)
-                    break
-        self._render_detail()
-        self._render_channels()
-        self._render_probes()
-        self._render_alerts()
+        self._in_render = True
+        try:
+            self._render_chrome()
+            if self.released:
+                # Released: the device table is NOT rebuilt. Fighting
+                # DataTable over scroll/cursor on every rebuild loses
+                # (it scrolls to its cursor during its own refresh),
+                # and a frozen table is the honest version of "no
+                # anchor" anyway: nothing moves under the user, while
+                # the stats strip / channels / probes / GPS stay live
+                # from the same poll. Re-grabbing rebuilds the table
+                # from the already-current device list.
+                self._render_detail()
+                self._render_channels()
+                self._render_probes()
+                self._render_alerts()
+                return
+            table = self.query_one("#devices", DataTable)
+            cursor_mac = None
+            if table.cursor_row is not None \
+                    and 0 <= table.cursor_row < len(self._by_row):
+                cursor_mac = self._by_row[table.cursor_row].mac
+            rows = self.visible()
+            table.clear()
+            self._by_row = rows
+            for d in rows:
+                table.add_row(
+                    Text(str(d.signal) if d.signal else "—", style=sig_style(d.signal)),
+                    Text(d.signal_bar(6), style=sig_style(d.signal)),
+                    d.mac, d.display_name[:19], d.category[:6], (d.crypt or "—")[:10],
+                    d.channel or "—", str(d.packets), fmt_age(d.last_seen),
+                    Text("NEW", style="bold black on yellow") if d.is_new else "",
+                    key=d.mac or d.key)
+            if cursor_mac:
+                for i, d in enumerate(rows):
+                    if d.mac == cursor_mac:
+                        table.move_cursor(row=i)
+                        break
+            self._render_detail()
+            self._render_channels()
+            self._render_probes()
+            self._render_alerts()
+        finally:
+            self._in_render = False
 
     def _selected(self) -> Device | None:
+        if self.released:
+            return None
         table = self.query_one("#devices", DataTable)
         if table.cursor_row is not None and 0 <= table.cursor_row < len(self._by_row):
             return self._by_row[table.cursor_row]
@@ -274,6 +300,20 @@ class KismetTUI(App):
     def _render_detail(self) -> None:
         d = self._selected()
         pane = self.query_one("#detail", Static)
+        if self.released:
+            heard = [x for x in self.devices if not x.inferred]
+            lines = ["[b]Selection released[/b]",
+                     "The device list is frozen where you left it;",
+                     "the counts and panes above/below stay live.",
+                     "",
+                     "Press ↑ / ↓ or u to grab a device again."]
+            if heard:
+                strong = max(heard, key=lambda x: x.signal)
+                fresh = max(heard, key=lambda x: x.last_seen)
+                lines += ["", f"strongest  {strong.signal} dBm  {strong.display_name}",
+                          f"freshest   {fmt_age(fresh.last_seen)} ago  {fresh.display_name}"]
+            pane.update("\n".join(lines))
+            return
         if not d:
             pane.update("No devices match the current filter.")
             return
@@ -338,8 +378,39 @@ class KismetTUI(App):
             table.add_row(a.when, a.header, a.message[:70])
 
     # -- events / actions --------------------------------------------------
+    _NAV_KEYS = {"up", "down", "pageup", "pagedown", "home", "end"}
+
+    async def on_event(self, event) -> None:
+        # Re-grab on navigation keys while released. This has to happen
+        # BEFORE the event reaches the table: with the cursor hidden,
+        # DataTable treats up/down as *scroll* keys and never moves the
+        # cursor, so no highlight event ever fires to re-grab from.
+        # Rebuilding the (frozen) table first makes the same keypress
+        # behave normally against current data.
+        if self.released and isinstance(event, events.Key) \
+                and event.key in self._NAV_KEYS \
+                and self.focused is not None \
+                and self.focused.id == "devices":
+            self.released = False
+            self.query_one("#devices", DataTable).show_cursor = True
+            self._render_all()
+        await super().on_event(event)
+
     def on_data_table_row_highlighted(self, _event) -> None:
-        self._render_detail()
+        if not self._in_render:
+            self._render_detail()
+
+    def action_toggle_release(self) -> None:
+        self.released = not self.released
+        table = self.query_one("#devices", DataTable)
+        table.show_cursor = not self.released
+        if self.released:
+            self._render_chrome()
+            self._render_detail()
+        elif self.devices:
+            self._render_all()
+        else:
+            self._render_chrome()
 
     def on_input_changed(self, event: Input.Changed) -> None:
         self.query = event.value.strip()

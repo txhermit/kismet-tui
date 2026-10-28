@@ -59,6 +59,7 @@ No Textual handy? The parsing core (`kismet_tui/models.py`, `client.py`, `demo.p
 | `i` | show/hide inferred |
 | `s` | cycle sort: signal → packets → last seen → name |
 | `S` | reverse the current sort direction (label shows ↓/↑) |
+| `u` | release / re-grab the selection — released means no device anchor: the highlight disappears and the device table freezes exactly where it is (stats strip, channels, probes, GPS stay live; label shows `RELEASED`). Moving with ↑/↓ also re-grabs, rebuilding the table from current data |
 | `p` | pause polling · `r` resume/refresh now |
 | `e` | export visible devices to `~/kismet-tui-export-<ts>.csv` |
 | `↑↓` | move between devices (detail pane follows) |
@@ -101,6 +102,8 @@ REST endpoints used (all polled, all fail-soft): `devices/views/all/devices.json
 - Channel pane is counts, not a spectrum waterfall. Kismet doesn't give you a waterfall over REST anyway.
 
 ## Changelog
+
+**0.1.3** — release-the-selection: normally the viewport is anchored to the highlighted device (each refresh re-finds it and scrolls it back into view, so on a busy scan your view sinks as that device ages). `u` releases it: no anchor, no highlight, and the device table freezes exactly where it is — while the stats strip and the other panes keep updating from live polls, so the scan visibly stays alive. (The table freezes rather than updating in place because DataTable insists on scrolling to its cursor on every rebuild; a frozen table is the honest version of "nothing moves under me.") The detail pane shows strongest/freshest instead. Any cursor movement re-grabs and rebuilds the table from current data.
 
 **0.1.2** — reversible sorts: `S` flips the current sort's direction (numeric sorts default descending, name ascending; cycling with `s` resets to the natural direction). The filter label shows the direction as ↓/↑.
 
