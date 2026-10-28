@@ -212,11 +212,13 @@ class KismetTUI(App):
             + (f"   ⚠ {self.error}" if self.error else ""))
         heard = [d for d in self.devices if not d.inferred]
         located = [d for d in heard if d.located]
-        c = Counter(d.type or "?" for d in heard)
+        c = Counter(d.category for d in heard)
+        bt = sum(1 for d in heard if d.phy == "Bluetooth"
+                 or d.category in ("BTLE", "Bluetooth"))
         self.query_one("#stats", Static).update(
             f"devices {len(heard)}  (+{len(self.devices) - len(heard)} inferred)   "
             f"AP {c.get('AP', 0)}  clients {c.get('Client', 0)}  "
-            f"BT {sum(v for k, v in c.items() if 'BT' in k)}   "
+            f"BT {bt}   "
             f"new<5m {sum(1 for d in heard if d.is_new)}   "
             f"located {len(located)}/{len(heard) or 1} "
             f"({(100 * len(located) // len(heard)) if heard else 0}%)   "
@@ -239,7 +241,7 @@ class KismetTUI(App):
             table.add_row(
                 Text(str(d.signal) if d.signal else "—", style=sig_style(d.signal)),
                 Text(d.signal_bar(6), style=sig_style(d.signal)),
-                d.mac, d.display_name[:19], d.type, (d.crypt or "—")[:10],
+                d.mac, d.display_name[:19], d.category[:6], (d.crypt or "—")[:10],
                 d.channel or "—", str(d.packets), fmt_age(d.last_seen),
                 Text("NEW", style="bold black on yellow") if d.is_new else "",
                 key=d.mac or d.key)

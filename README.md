@@ -99,6 +99,10 @@ REST endpoints used (all polled, all fail-soft): `devices/views/all/devices.json
 - No Kismet *control* (no datasource/channel hopping changes) — read-only by design, like the Grafana exporter.
 - Channel pane is counts, not a spectrum waterfall. Kismet doesn't give you a waterfall over REST anyway.
 
+## Changelog
+
+**0.1.1** — the "everything is inferred" fix. v0.1.0's parser was written against an invented record shape and read signal from a top-level `kismet.common.signal` map Kismet never sends, so every real device parsed as signal 0 / packets 0 and landed in the inferred bucket. Fixed against ground truth (a real 19,007-device `.kismet` log + the field paths the Kismet web UI and the kismet-grafana exporter actually use): signal from `kismet.device.base.signal`, packets from the flat `kismet.device.base.packets.total`, location from `base.location → avg_loc → geopoint [lon, lat]`, GPS from the same geopoint shape, full type strings ("Wi-Fi AP") categorised properly. Also fixed: the `.kismet` reader returning zero devices (sqlite returns the device column as bytes), SSID extraction inventing SSIDs out of record fields like "HT20"/"US", packet rate now derived from packet-total deltas, and `.kismet` re-parsing is cached on file mtime/size. The test fixtures are now built from the real record structure — that's the actual lesson here.
+
 ## License
 
 MIT, do what you want. Built for shits and grins, kept because it's useful.

@@ -37,17 +37,81 @@ def _get(d: Any, *keys: str, default: Any = None) -> Any:
 
 
 def _sig(device: dict) -> int:
-    sig = _get(device, "kismet.common.signal")
-    if isinstance(sig, dict):
-        for key in ("kismet.common.signal.last_signal",
-                    "kismet.common.signal.peak_signal"):
-            v = sig.get(key)
-            if isinstance(v, (int, float)) and v != 0:
-                return int(v)
-    v = device.get("kismet.common.signal.last_signal")
+    """Signal, in every shape Kismet actually emits it.
+
+    Real shape (verified against a live .kismet log, 2026-10-28): the
+    signal component hangs off the device as ``kismet.device.base.signal``
+    -- a map of ``kismet.common.signal.*`` fields.  v0.1.0 looked for a
+    top-level ``kismet.common.signal`` map that Kismet never sends, so
+    every device parsed as signal 0.  Also accepted: the field-simplified
+    alias ``last_signal`` (what kismet-grafana's exporter requests) and a
+    flat ``kismet.common.signal.last_signal``.
+    """
+    for container in (device.get("kismet.device.base.signal"),
+                      device.get("kismet.common.signal")):
+        if isinstance(container, dict):
+            for key in ("kismet.common.signal.last_signal",
+                        "kismet.common.signal.peak_signal",
+                        "kismet.common.signal.max_signal"):
+                v = container.get(key)
+                if isinstance(v, (int, float)) and v != 0:
+                    return int(v)
+    for key in ("last_signal", "kismet.common.signal.last_signal"):
+        v = device.get(key)
+        if isinstance(v, (int, float)) and v != 0:
+            return int(v)
+    return 0
+
+
+def _packets(device: dict) -> int:
+    """Packet total. Real shape is FLAT keys on the device --
+    ``kismet.device.base.packets.total`` (plus rx_total / tx_total / ...)
+    -- not the scalar ``kismet.device.base.packets`` v0.1.0 guessed.
+    A map-shaped ``base.packets`` and the plain scalar are also accepted.
+    """
+    v = device.get("kismet.device.base.packets.total")
     if isinstance(v, (int, float)):
         return int(v)
+    pk = device.get("kismet.device.base.packets")
+    if isinstance(pk, dict):
+        total = pk.get("kismet.device.base.packets.total")
+        if isinstance(total, (int, float)):
+            return int(total)
+        rx = pk.get("kismet.device.base.packets.rx_total") or 0
+        tx = pk.get("kismet.device.base.packets.tx_total") or 0
+        return int(rx) + int(tx)
+    if isinstance(pk, (int, float)):
+        return int(pk)
     return 0
+
+
+def _location(device: dict) -> tuple[float, float]:
+    """(lat, lon). Real shape: ``kismet.device.base.location`` map whose
+    avg_loc / last / min_loc / max_loc entries carry a
+    ``kismet.common.location.geopoint`` of [lon, lat] -- the same path
+    kismet-grafana's exporter reads.  The older avg_lat_lon {lat, lon}
+    shape is kept as a fallback."""
+    loc = device.get("kismet.device.base.location")
+    if isinstance(loc, dict):
+        for sub_name in ("kismet.common.location.avg_loc",
+                         "kismet.common.location.last",
+                         "kismet.common.location.min_loc",
+                         "kismet.common.location.max_loc"):
+            sub = loc.get(sub_name)
+            if isinstance(sub, dict):
+                gp = sub.get("kismet.common.location.geopoint")
+                if isinstance(gp, (list, tuple)) and len(gp) >= 2 \
+                        and gp[0] and gp[1]:
+                    return float(gp[1]), float(gp[0])
+    legacy = _get(device, "kismet.common.location")
+    if isinstance(legacy, dict):
+        avg = legacy.get("kismet.common.location.avg_lat_lon") or legacy
+        if isinstance(avg, dict):
+            lat = float(avg.get("kismet.location.lat") or 0.0)
+            lon = float(avg.get("kismet.location.lon") or 0.0)
+            if lat or lon:
+                return lat, lon
+    return 0.0, 0.0
 
 
 def _ssids(device: dict) -> tuple[list[str], list[str]]:
@@ -59,16 +123,20 @@ def _ssids(device: dict) -> tuple[list[str], list[str]]:
         return advertised, probed
 
     def _collect(container: Any, out: list[str]) -> None:
+        # Real shape (verified 2026-10-28): the ssid maps are LISTS of
+        # record dicts, and each record carries ~15 fields (ssid, channel,
+        # ht_mode, crypt_set, country...). Take the ssid field of a record
+        # and STOP -- v0.1.0 recursed into the record's other values and
+        # returned "6", "HT20", "US" as if they were SSIDs.
         if isinstance(container, dict):
-            # map of bssid/mac -> record, or ssid -> record
+            ssid = (container.get("dot11.advertisedssid.ssid")
+                    or container.get("dot11.probedssid.ssid"))
+            if ssid:
+                if str(ssid) not in out:
+                    out.append(str(ssid))
+                return
             for rec in container.values():
-                if isinstance(rec, dict):
-                    ssid = (rec.get("dot11.advertisedssid.ssid")
-                            or rec.get("dot11.probedssid.ssid") or "")
-                    if ssid and ssid not in out:
-                        out.append(str(ssid))
-                elif isinstance(rec, str) and rec and rec not in out:
-                    out.append(rec)
+                _collect(rec, out)
         elif isinstance(container, list):
             for rec in container:
                 _collect(rec, out)
@@ -121,6 +189,27 @@ class Device:
 
     # -- derived ---------------------------------------------------------
     @property
+    def category(self) -> str:
+        """Short class for the table/stats: AP, Client, BTLE, ...
+
+        Kismet's real type strings are full-length ("Wi-Fi AP",
+        "Wi-Fi Client", "Wi-Fi Bridged", "BTLE"); the demo and the
+        .kismet summary column use the same strings, so categorise
+        from the raw type rather than expecting "AP" verbatim.
+        """
+        t = self.type or ""
+        low = f" {t.lower()} "
+        if " ap " in low or low.strip() == "ap":
+            return "AP"
+        if "client" in low:
+            return "Client"
+        if "bridged" in low or "wired" in low:
+            return "Bridged"
+        if "ad-hoc" in low or "adhoc" in low or "peer" in low:
+            return "Peer"
+        return t or "?"
+
+    @property
     def inferred(self) -> bool:
         """Never actually heard transmitting.
 
@@ -170,25 +259,20 @@ def parse_device(raw: dict) -> Device | None:
     if not isinstance(raw, dict):
         return None
     base = "kismet.device.base."
-    loc = _get(raw, "kismet.common.location")
-    lat = lon = 0.0
-    if isinstance(loc, dict):
-        avg = loc.get("kismet.common.location.avg_lat_lon") or loc
-        if isinstance(avg, dict):
-            lat = float(avg.get("kismet.location.lat") or 0.0)
-            lon = float(avg.get("kismet.location.lon") or 0.0)
+    lat, lon = _location(raw)
     advertised, probed = _ssids(raw)
+    freq = raw.get(base + "frequency") or 0
     dev = Device(
         key=str(raw.get(base + "key") or ""),
         mac=str(raw.get(base + "macaddr") or ""),
-        name=str(raw.get(base + "name") or ""),
+        name=str(raw.get(base + "name") or raw.get(base + "commonname") or ""),
         phy=str(raw.get(base + "phyname") or ""),
-        type=str(raw.get(base + "basic_type") or raw.get(base + "type") or ""),
+        type=str(raw.get(base + "type") or raw.get(base + "basic_type") or ""),
         crypt=str(raw.get(base + "crypt") or ""),
         channel=str(raw.get(base + "channel") or ""),
-        freq=int(raw.get(base + "frequency") or 0),
+        freq=int(float(freq)) if isinstance(freq, (int, float)) else 0,
         signal=_sig(raw),
-        packets=int(raw.get(base + "packets") or raw.get("kismet.device.base.packets") or 0),
+        packets=_packets(raw),
         manuf=str(raw.get(base + "manuf") or ""),
         first_seen=float(raw.get(base + "first_time") or 0),
         last_seen=float(raw.get(base + "last_time") or 0),
@@ -198,9 +282,9 @@ def parse_device(raw: dict) -> Device | None:
         probed=probed,
         clients=_clients(raw),
     )
-    ds = raw.get("kismet.device.base.datasources")
-    if isinstance(ds, list):
-        dev.datasources = len(ds)
+    seenby = raw.get("kismet.device.base.seenby")
+    if isinstance(seenby, (list, dict)):
+        dev.datasources = len(seenby)
     return dev
 
 
@@ -217,6 +301,9 @@ def parse_devices(payload: Any) -> list[Device]:
         rows = []
     out: list[Device] = []
     for r in rows:
+        if isinstance(r, (bytes, bytearray)):
+            # sqlite hands back the .kismet `device` column as bytes.
+            r = bytes(r).decode("utf-8", "replace")
         if isinstance(r, str):
             try:
                 r = json.loads(r)
