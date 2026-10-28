@@ -79,6 +79,7 @@ class KismetTUI(App):
         Binding("n", "toggle_new", "New only"),
         Binding("i", "toggle_inferred", "Inferred"),
         Binding("s", "cycle_sort", "Sort"),
+        Binding("S", "toggle_sort_dir", "Reverse sort"),
         Binding("e", "export_csv", "Export CSV"),
     ]
 
@@ -95,6 +96,7 @@ class KismetTUI(App):
         self.error = ""
         self.paused = False
         self.sort_by = "signal"
+        self.sort_flipped = False
         self.phy_filter = "ALL"
         self.new_only = False
         self.show_inferred = False
@@ -193,7 +195,14 @@ class KismetTUI(App):
         key = {"signal": lambda d: d.signal, "packets": lambda d: d.packets,
                "last_seen": lambda d: d.last_seen,
                "name": lambda d: d.display_name.lower()}[self.sort_by]
-        return sorted(out, key=key, reverse=self.sort_by != "name")
+        return sorted(out, key=key, reverse=self.sort_reverse)
+
+    @property
+    def sort_reverse(self) -> bool:
+        """Effective direction: numeric sorts default to descending
+        (strongest / busiest / most recent first), name to ascending;
+        `S` flips whichever default the current sort has."""
+        return (self.sort_by != "name") ^ self.sort_flipped
 
     # -- rendering ---------------------------------------------------------
     def _render_chrome(self) -> None:
@@ -224,7 +233,8 @@ class KismetTUI(App):
             f"({(100 * len(located) // len(heard)) if heard else 0}%)   "
             f"alerts {len(self.alerts)}")
         self.query_one("#filterlabel", Static).update(
-            f"sort:{self.sort_by}  phy:{self.phy_filter}"
+            f"sort:{self.sort_by}{'↓' if self.sort_reverse else '↑'}"
+            f"  phy:{self.phy_filter}"
             f"{'  NEW-ONLY' if self.new_only else ''}"
             f"{'  +inferred' if self.show_inferred else ''}")
 
@@ -376,6 +386,12 @@ class KismetTUI(App):
     def action_cycle_sort(self) -> None:
         i = SORTS.index(self.sort_by)
         self.sort_by = SORTS[(i + 1) % len(SORTS)]
+        self.sort_flipped = False   # new sort starts at its natural direction
+        if self.devices:
+            self._render_all()
+
+    def action_toggle_sort_dir(self) -> None:
+        self.sort_flipped = not self.sort_flipped
         if self.devices:
             self._render_all()
 
